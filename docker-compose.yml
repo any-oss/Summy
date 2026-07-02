@@ -1,0 +1,48 @@
+version: '3.8'
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./web:/usr/share/nginx/html:ro
+    depends_on:
+      - gateway
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - MEMORY_LOADER_HOST=http://memory-loader:9010
+      - DB_PATH=/data/summy.db
+    volumes:
+      - ./config:/app/config
+      - summy-data:/data
+    depends_on:
+      - ollama
+      - memory-loader
+
+  memory-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile.memory
+    ports:
+      - "9010:9010"
+    volumes:
+      - ./config:/app/config
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  summy-data:
+  ollama-data:

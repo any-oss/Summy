@@ -1,0 +1,26 @@
+version: "1.4.0"
+host: "0.0.0.0"
+port: 8000
+auth:
+  enabled: false
+  token: ""
+models:
+  map:
+    code_generation: "deepseek-coder:1.3b-q4_K_M"
+    reasoning: "tinyllama:1.1b-q5_K_M"
+    tool: "phi:2-q4_K_M"
+  default: "tinyllama:1.1b-q5_K_M"
+ollama:
+  endpoint: "http://ollama:11434/api/generate"
+  options:
+    num_predict: 512
+    temperature: 0.3
+claude:
+  enabled: false
+  api_key: ""
+memory_loader:
+  port: 9010
+db_path: "/data/summy.db"
+rate_limit:
+  tokens_per_minute: 10
+  burst: 3
