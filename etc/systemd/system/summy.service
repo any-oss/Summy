@@ -1,0 +1,18 @@
+[Unit]
+Description=Summy v1.4.0 Autonomous Edge AI Node
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/summy/env
+ExecStartPre=/usr/bin/docker compose -f /opt/summy/docker-compose.yml pull --quiet
+ExecStart=/usr/bin/docker compose -f /opt/summy/docker-compose.yml up -d --remove-orphans
+ExecStartPost=/opt/summy/scripts/validate_startup.sh
+ExecStop=/usr/bin/docker compose -f /opt/summy/docker-compose.yml down --remove-orphans
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
