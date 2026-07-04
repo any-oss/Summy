@@ -41,7 +41,6 @@ class ResourceWarden:
                         value_kb = int(value_parts[0])
                         meminfo[key] = value_kb
         except (FileNotFoundError, ValueError, PermissionError):
-            # Fallback for non-Linux systems or testing
             import psutil
             mem = psutil.virtual_memory()
             meminfo = {
@@ -115,13 +114,13 @@ class ResourceWarden:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(url, json={
-                    'model': 'dummy',
-                    'prompt': '',
-                    'keep_alive': 0
-                }, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                async with session.post(
+                    url,
+                    json={'model': 'dummy', 'prompt': '', 'keep_alive': 0},
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
                     if response.status == 200:
-                        print(f"[WARDEN] Model eviction signal sent")
+                        print("[WARDEN] Model eviction signal sent")
         except Exception as e:
             print(f"[WARDEN] Model eviction failed: {e}")
 

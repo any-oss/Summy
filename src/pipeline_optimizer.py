@@ -4,10 +4,11 @@ Tracks inference latency and calculates routing weights for model selection.
 """
 
 import asyncio
+import os
 import sqlite3
 import time
-from typing import Optional, Dict, List
 from contextlib import contextmanager
+from typing import Dict, List, Optional
 
 
 class PipelineOptimizer:
@@ -32,7 +33,6 @@ class PipelineOptimizer:
 
     def _init_db(self):
         """Initialize the SQLite database schema."""
-        import os
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
         with self._get_connection() as conn:
@@ -52,7 +52,9 @@ class PipelineOptimizer:
                     timestamp REAL NOT NULL
                 )
             """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_history_timestamp ON inference_history(timestamp)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_history_timestamp ON inference_history(timestamp)"
+            )
             conn.commit()
 
     async def record_latency(self, model_name: str, latency_ms: float):

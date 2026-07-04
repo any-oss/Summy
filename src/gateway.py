@@ -7,15 +7,45 @@ import asyncio
 import json
 import os
 import time
-from typing import Dict, Optional, Any
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, Optional
 
 import aiohttp
 from aiohttp import web
 import yaml
 
-from warden import get_warden, ResourceWarden
-from pipeline_optimizer import get_optimizer, PipelineOptimizer
+from warden import ResourceWarden, get_warden
+from pipeline_optimizer import PipelineOptimizer, get_optimizer
 from traffic_shaper import TrafficShaper
+
+
+# Configuration constants
+DEFAULT_MODEL = "tinyllama:1.1b-q5_K_M"
+DEFAULT_DB_PATH = "/data/summy.db"
+DEFAULT_OLLAMA_ENDPOINT = "http://ollama:11434/api/generate"
+DEFAULT_NUM_PREDICT = 512
+DEFAULT_TEMPERATURE = 0.3
+MODEL_KEEP_ALIVE_SEC = 300
+REQUEST_TIMEOUT_SEC = 120
+
+
+class TaskType(str, Enum):
+    """Supported task types for model routing."""
+    CODE = "code"
+    REASONING = "reasoning"
+    TOOL = "tool"
+    GENERAL = "general"
+
+
+@dataclass
+class InferenceResult:
+    """Result of an inference operation."""
+    success: bool
+    response: Optional[str] = None
+    error: Optional[str] = None
+    model: Optional[str] = None
+    latency_ms: float = 0.0
 
 
 class MultiplexingGateway:
@@ -25,19 +55,17 @@ class MultiplexingGateway:
         self.config = self._load_config(config_path)
         self.warden: ResourceWarden = get_warden()
         self.optimizer: PipelineOptimizer = get_optimizer(
-            db_path=self.config.get('db_path', '/data/summy.db')
+            db_path=self.config.get('db_path', DEFAULT_DB_PATH)
         )
+        rate_limit = self.config.get('rate_limit', {})
         self.shaper = TrafficShaper(
-            tokens_per_minute=self.config.get('rate_limit', {}).get('tokens_per_minute', 10),
-            burst=self.config.get('rate_limit', {}).get('burst', 3)
+            tokens_per_minute=rate_limit.get('tokens_per_minute', 10),
+            burst=rate_limit.get('burst', 3)
         )
-        self.ollama_endpoint = self.config.get('ollama', {}).get(
-            'endpoint', 'http://ollama:11434/api/generate'
-        )
+        ollama_config = self.config.get('ollama', {})
+        self.ollama_endpoint = ollama_config.get('endpoint', DEFAULT_OLLAMA_ENDPOINT)
         self.model_map = self.config.get('models', {}).get('map', {})
-        self.default_model = self.config.get('models', {}).get(
-            'default', 'tinyllama:1.1b-q5_K_M'
-        )
+        self.default_model = self.config.get('models', {}).get('default', DEFAULT_MODEL)
         self.app = web.Application()
         self._setup_routes()
 
@@ -64,10 +92,7 @@ class MultiplexingGateway:
         tool_instruction: Optional[str] = None,
         context: Optional[str] = None
     ) -> str:
-        """
-        Build a composite prompt merging multiple task types.
-        Optimizes for single-pass inference to reduce latency.
-        """
+        """Build a composite prompt merging multiple task types."""
         sections = []
 
         if context:
@@ -85,7 +110,6 @@ class MultiplexingGateway:
         if not sections:
             return ""
 
-        # Add instruction for structured output
         sections.append(
             "INSTRUCTIONS:\n"
             "- Address all tasks in your response\n"
@@ -107,11 +131,11 @@ class MultiplexingGateway:
         model: str,
         prompt: str,
         options: Optional[dict] = None
-    ) -> Dict[str, Any]:
+    ) -> InferenceResult:
         """Send request to Ollama API and return response."""
         default_options = self.config.get('ollama', {}).get('options', {
-            'num_predict': 512,
-            'temperature': 0.3
+            'num_predict': DEFAULT_NUM_PREDICT,
+            'temperature': DEFAULT_TEMPERATURE
         })
 
         if options:
@@ -122,7 +146,7 @@ class MultiplexingGateway:
             'prompt': prompt,
             'stream': False,
             'options': default_options,
-            'keep_alive': 300  # Keep model loaded for 5 minutes
+            'keep_alive': MODEL_KEEP_ALIVE_SEC
         }
 
         start_time = time.time()
@@ -132,46 +156,42 @@ class MultiplexingGateway:
                 async with session.post(
                     self.ollama_endpoint,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120)
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC)
                 ) as response:
                     latency_ms = (time.time() - start_time) * 1000
 
                     if response.status != 200:
-                        return {
-                            'success': False,
-                            'error': f"Ollama API returned status {response.status}",
-                            'latency_ms': latency_ms
-                        }
+                        return InferenceResult(
+                            success=False,
+                            error=f"Ollama API returned status {response.status}",
+                            latency_ms=latency_ms
+                        )
 
                     result = await response.json()
-
-                    # Record latency for optimizer
                     await self.optimizer.record_latency(model, latency_ms)
 
-                    return {
-                        'success': True,
-                        'response': result.get('response', ''),
-                        'model': model,
-                        'latency_ms': latency_ms,
-                        'done': result.get('done', True)
-                    }
+                    return InferenceResult(
+                        success=True,
+                        response=result.get('response', ''),
+                        model=model,
+                        latency_ms=latency_ms
+                    )
 
         except asyncio.TimeoutError:
-            return {
-                'success': False,
-                'error': 'Ollama API timeout',
-                'latency_ms': (time.time() - start_time) * 1000
-            }
+            return InferenceResult(
+                success=False,
+                error='Ollama API timeout',
+                latency_ms=(time.time() - start_time) * 1000
+            )
         except aiohttp.ClientError as e:
-            return {
-                'success': False,
-                'error': f'Ollama connection error: {str(e)}',
-                'latency_ms': (time.time() - start_time) * 1000
-            }
+            return InferenceResult(
+                success=False,
+                error=f'Ollama connection error: {str(e)}',
+                latency_ms=(time.time() - start_time) * 1000
+            )
 
     async def handle_inference(self, request: web.Request) -> web.Response:
         """Handle multiplexed inference request."""
-        # Rate limiting check
         client_ip = request.remote or 'unknown'
         if not self.shaper.allow_request(client_ip):
             return web.json_response(
@@ -187,19 +207,11 @@ class MultiplexingGateway:
                 status=400
             )
 
-        # Extract task components
-        code_instr = body.get('code')
-        reasoning_instr = body.get('reasoning')
-        tool_instr = body.get('tool')
-        context = body.get('context')
-        task_type = body.get('task_type', 'general')
-
-        # Build composite prompt
         prompt = self._build_composite_prompt(
-            code_instruction=code_instr,
-            reasoning_instruction=reasoning_instr,
-            tool_instruction=tool_instr,
-            context=context
+            code_instruction=body.get('code'),
+            reasoning_instruction=body.get('reasoning'),
+            tool_instruction=body.get('tool'),
+            context=body.get('context')
         )
 
         if not prompt.strip():
@@ -208,7 +220,6 @@ class MultiplexingGateway:
                 status=400
             )
 
-        # Acquire model lock through warden
         lock_acquired = await self.warden.acquire_model_lock()
         if not lock_acquired:
             return web.json_response(
@@ -217,30 +228,25 @@ class MultiplexingGateway:
             )
 
         try:
-            # Select model
-            if task_type in self.model_map:
-                model = self.model_map[task_type]
-            else:
-                available_models = list(self.model_map.values())
-                model = await self.optimizer.get_best_model(task_type, available_models)
-                if not model:
-                    model = self.default_model
+            task_type = body.get('task_type', TaskType.GENERAL.value)
+            model = self.model_map.get(task_type) or await self.optimizer.get_best_model(
+                task_type, list(self.model_map.values())
+            ) or self.default_model
 
-            # Execute inference
             result = await self._call_ollama(model=model, prompt=prompt)
 
-            if result['success']:
+            if result.success:
                 return web.json_response({
                     'success': True,
-                    'response': result['response'],
-                    'model_used': result['model'],
-                    'latency_ms': result['latency_ms']
+                    'response': result.response,
+                    'model_used': result.model,
+                    'latency_ms': result.latency_ms
                 })
             else:
                 return web.json_response({
                     'success': False,
-                    'error': result['error'],
-                    'latency_ms': result.get('latency_ms', 0)
+                    'error': result.error,
+                    'latency_ms': result.latency_ms
                 }, status=502)
 
         finally:
@@ -270,7 +276,6 @@ class MultiplexingGateway:
                 status=400
             )
 
-        # Acquire model lock
         lock_acquired = await self.warden.acquire_model_lock()
         if not lock_acquired:
             return web.json_response(
@@ -279,20 +284,19 @@ class MultiplexingGateway:
             )
 
         try:
-            model = self.default_model
-            result = await self._call_ollama(model=model, prompt=message)
+            result = await self._call_ollama(model=self.default_model, prompt=message)
 
-            if result['success']:
+            if result.success:
                 return web.json_response({
                     'success': True,
-                    'response': result['response'],
-                    'model_used': result['model'],
-                    'latency_ms': result['latency_ms']
+                    'response': result.response,
+                    'model_used': result.model,
+                    'latency_ms': result.latency_ms
                 })
             else:
                 return web.json_response({
                     'success': False,
-                    'error': result['error']
+                    'error': result.error
                 }, status=502)
 
         finally:
