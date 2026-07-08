@@ -1,6 +1,7 @@
 """
 Resource Warden - Asynchronous resource monitor for OOM prediction and prevention.
-Monitors physical memory usage and enforces serialized model loading.
+Monitors physical memory usage, predicts OOM events using linear regression,
+and enforces serialized model loading via asyncio.Lock.
 """
 
 import asyncio
@@ -10,184 +11,202 @@ from typing import Optional, Tuple
 
 
 class ResourceWarden:
-    """Monitors system memory and predicts OOM events using linear regression."""
+    """Monitors system memory and prevents OOM events during model inference."""
 
-    def __init__(self, memory_limit_mb: float = 2200.0, prediction_window_sec: int = 5):
-        self.memory_limit_mb = memory_limit_mb
-        self.prediction_window_sec = prediction_window_sec
-        self.memory_samples: deque = deque(maxlen=10)
-        self.sample_interval_sec = 0.5
-        self._lock: Optional[asyncio.Lock] = None
-        self._monitoring: bool = False
+    def __init__(
+        self,
+        meminfo_path: str = "/proc/meminfo",
+        memory_limit_mb: float = 2200.0,
+        window_size: int = 10,
+        prediction_horizon_seconds: float = 5.0,
+        ollama_host: str = "http://ollama:11434",
+    ):
+        self.meminfo_path = meminfo_path
+        self.memory_limit_bytes = int(memory_limit_mb * 1024 * 1024)
+        self.window_size = window_size
+        self.prediction_horizon = prediction_horizon_seconds
+        self.ollama_host = ollama_host
+
+        # Rolling window for memory samples: (timestamp, used_bytes)
+        self._memory_window: deque = deque(maxlen=window_size)
+        self._lock = asyncio.Lock()
+        self._monitoring = False
         self._monitor_task: Optional[asyncio.Task] = None
 
     @property
     def lock(self) -> asyncio.Lock:
-        """Get or create the async lock for serialized model loading."""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
+        """Return the async lock for serialized model loading."""
         return self._lock
 
     def _read_meminfo(self) -> dict:
-        """Read physical memory information from /proc/meminfo."""
+        """Parse /proc/meminfo and return memory values in bytes."""
         meminfo = {}
         try:
-            with open('/proc/meminfo', 'r') as f:
+            with open(self.meminfo_path, "r") as f:
                 for line in f:
-                    parts = line.split(':')
-                    if len(parts) == 2:
-                        key = parts[0].strip()
-                        value_parts = parts[1].strip().split()
-                        value_kb = int(value_parts[0])
-                        meminfo[key] = value_kb
-        except (FileNotFoundError, ValueError, PermissionError):
-            import psutil
-            mem = psutil.virtual_memory()
+                    parts = line.split(":")
+                    if len(parts) != 2:
+                        continue
+                    key = parts[0].strip()
+                    value_part = parts[1].strip().split()
+                    if len(value_part) < 1:
+                        continue
+                    value = int(value_part[0])
+                    # Convert from kB to bytes
+                    meminfo[key] = value * 1024
+        except (IOError, OSError, ValueError):
+            # Fallback for non-Linux systems or read errors
             meminfo = {
-                'MemTotal': mem.total // 1024,
-                'MemAvailable': mem.available // 1024,
-                'MemFree': mem.free // 1024,
-                'Buffers': 0,
-                'Cached': 0,
+                "MemTotal": 4 * 1024 * 1024 * 1024,
+                "MemAvailable": 2 * 1024 * 1024 * 1024,
             }
         return meminfo
 
-    def _get_used_memory_mb(self) -> float:
-        """Calculate used memory in MB from /proc/meminfo."""
+    def _get_used_memory(self) -> int:
+        """Calculate currently used memory in bytes."""
         meminfo = self._read_meminfo()
-        total_kb = meminfo.get('MemTotal', 0)
-        available_kb = meminfo.get('MemAvailable', meminfo.get('MemFree', 0))
-        used_kb = total_kb - available_kb
-        return used_kb / 1024.0
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", 0)
+        return total - available
 
     def _linear_regression_slope(self) -> float:
         """
-        Calculate the slope of memory consumption using linear regression.
-        Returns slope in MB/sec.
+        Calculate the slope of memory consumption using simple linear regression.
+        Returns bytes per second.
         """
-        if len(self.memory_samples) < 2:
+        if len(self._memory_window) < 2:
             return 0.0
 
-        n = len(self.memory_samples)
-        x_values = list(range(n))
-        y_values = list(self.memory_samples)
+        n = len(self._memory_window)
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_xy = 0.0
+        sum_x2 = 0.0
 
-        x_mean = sum(x_values) / n
-        y_mean = sum(y_values) / n
+        first_timestamp = self._memory_window[0][0]
+        for ts, mem in self._memory_window:
+            x = ts - first_timestamp  # Relative time in seconds
+            y = float(mem)
+            sum_x += x
+            sum_y += y
+            sum_xy += x * y
+            sum_x2 += x * x
 
-        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values))
-        denominator = sum((x - x_mean) ** 2 for x in x_values)
-
-        if denominator == 0:
+        denominator = n * sum_x2 - sum_x * sum_x
+        if abs(denominator) < 1e-9:
             return 0.0
 
-        slope_per_sample = numerator / denominator
-        slope_per_sec = slope_per_sample / self.sample_interval_sec
-
-        return slope_per_sec
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+        return slope
 
     def _predict_oom(self) -> Tuple[bool, float]:
         """
-        Predict if OOM will occur within the prediction window.
+        Predict if OOM will occur within the prediction horizon.
         Returns (will_oom, time_to_oom_seconds).
         """
-        current_memory = self.memory_samples[-1] if self.memory_samples else 0
+        current_used = self._get_used_memory()
         slope = self._linear_regression_slope()
 
         if slope <= 0:
-            return False, float('inf')
+            return False, float("inf")
 
-        remaining_memory = self.memory_limit_mb - current_memory
-        if remaining_memory <= 0:
+        remaining_bytes = self.memory_limit_bytes - current_used
+        if remaining_bytes <= 0:
             return True, 0.0
 
-        time_to_oom = remaining_memory / slope
+        time_to_oom = remaining_bytes / slope
+        will_oom = time_to_oom < self.prediction_horizon
 
-        return time_to_oom <= self.prediction_window_sec, time_to_oom
+        return will_oom, time_to_oom
 
-    async def _evict_model(self):
-        """Send HTTP POST to Ollama API to evict current model."""
+    async def _evict_model(self) -> bool:
+        """Send request to Ollama to evict the current model."""
         import aiohttp
 
-        ollama_host = os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
-        url = f"{ollama_host}/api/generate"
+        url = f"{self.ollama_host}/api/generate"
+        payload = {
+            "model": "dummy",
+            "prompt": "",
+            "keep_alive": 0,
+        }
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json={'model': 'dummy', 'prompt': '', 'keep_alive': 0},
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    if response.status == 200:
-                        print("[WARDEN] Model eviction signal sent")
-        except Exception as e:
-            print(f"[WARDEN] Model eviction failed: {e}")
+                async with session.post(url, json=payload, timeout=5.0) as resp:
+                    return resp.status == 200
+        except Exception:
+            return False
 
-    async def _monitor_loop(self):
-        """Continuous monitoring loop for memory sampling and OOM prediction."""
+    async def _monitor_loop(self) -> None:
+        """Background monitoring loop."""
         while self._monitoring:
-            current_memory = self._get_used_memory_mb()
-            self.memory_samples.append(current_memory)
+            timestamp = asyncio.get_event_loop().time()
+            used_memory = self._get_used_memory()
+            self._memory_window.append((timestamp, used_memory))
 
-            if len(self.memory_samples) >= 3:
-                will_oom, time_to_oom = self._predict_oom()
+            will_oom, time_to_oom = self._predict_oom()
 
-                if will_oom:
-                    print(f"[WARDEN] OOM PREDICTED: {time_to_oom:.2f}s until limit breach")
-                    print(f"[WARDEN] Current memory: {current_memory:.2f}MB / {self.memory_limit_mb:.2f}MB")
+            if will_oom:
+                async with self._lock:
+                    await self._evict_model()
 
-                    if self.lock.locked():
-                        print("[WARDEN] Model loading in progress, waiting...")
-                    else:
-                        await self._evict_model()
+            await asyncio.sleep(0.5)
 
-            await asyncio.sleep(self.sample_interval_sec)
-
-    def start_monitoring(self):
+    async def start_monitoring(self) -> None:
         """Start the background monitoring task."""
-        if not self._monitoring:
-            self._monitoring = True
-            self._monitor_task = asyncio.create_task(self._monitor_loop())
-            print(f"[WARDEN] Monitoring started (limit: {self.memory_limit_mb}MB)")
+        if self._monitoring:
+            return
 
-    def stop_monitoring(self):
+        self._monitoring = True
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
+    async def stop_monitoring(self) -> None:
         """Stop the background monitoring task."""
         self._monitoring = False
         if self._monitor_task:
             self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
             self._monitor_task = None
-        print("[WARDEN] Monitoring stopped")
 
-    async def acquire_model_lock(self) -> bool:
+    async def acquire_with_check(self, timeout: Optional[float] = None) -> bool:
         """
-        Attempt to acquire the model loading lock.
-        Returns True if lock acquired, False if memory conditions are critical.
+        Acquire the lock for model loading with OOM check.
+        Returns True if acquired successfully, False if OOM risk is too high.
         """
-        if len(self.memory_samples) >= 3:
-            will_oom, _ = self._predict_oom()
-            if will_oom:
-                print("[WARDEN] Lock acquisition denied - critical memory state")
-                return False
+        will_oom, _ = self._predict_oom()
+        if will_oom:
+            await self._evict_model()
 
-        await self.lock.acquire()
-        print("[WARDEN] Model lock acquired")
-        return True
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
-    def release_model_lock(self):
+    def release(self) -> None:
         """Release the model loading lock."""
-        if self.lock.locked():
-            self.lock.release()
-            print("[WARDEN] Model lock released")
+        if self._lock.locked():
+            self._lock.release()
 
+    def get_memory_status(self) -> dict:
+        """Return current memory status information."""
+        meminfo = self._read_meminfo()
+        total = meminfo.get("MemTotal", 0)
+        available = meminfo.get("MemAvailable", 0)
+        used = total - available
+        slope = self._linear_regression_slope()
+        will_oom, time_to_oom = self._predict_oom()
 
-# Singleton instance
-_warden_instance: Optional[ResourceWarden] = None
-
-
-def get_warden() -> ResourceWarden:
-    """Get or create the singleton ResourceWarden instance."""
-    global _warden_instance
-    if _warden_instance is None:
-        _warden_instance = ResourceWarden()
-    return _warden_instance
+        return {
+            "total_bytes": total,
+            "available_bytes": available,
+            "used_bytes": used,
+            "limit_bytes": self.memory_limit_bytes,
+            "usage_percent": (used / total * 100) if total > 0 else 0,
+            "slope_bytes_per_sec": slope,
+            "oom_predicted": will_oom,
+            "time_to_oom_seconds": time_to_oom if will_oom else None,
+        }
