@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Summy AI Gateway Dashboard">
+    <meta name="theme-color" content="#2563eb">
+    <title>Summy v1.4.0 - Dashboard</title>
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1d4ed8;
+            --success: #16a34a;
+            --warning: #ca8a04;
+            --danger: #dc2626;
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text: #1e293b;
+            --text-muted: #64748b;
+            --border: #e2e8f0;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: var(--card-bg);
+            border-bottom: 1px solid var(--border);
+            padding: 20px 0;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        header p {
+            color: var(--text-muted);
+            font-size: 14px;
+            margin-top: 5px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            border: 1px solid var(--border);
+        }
+
+        .card h2 {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: var(--text);
+        }
+
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stat:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        .stat-value {
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .status-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .status-healthy {
+            background: #dcfce7;
+            color: var(--success);
+        }
+
+        .status-warning {
+            background: #fef9c3;
+            color: var(--warning);
+        }
+
+        .status-error {
+            background: #fee2e2;
+            color: var(--danger);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--primary);
+            transition: width 0.3s ease;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 10px 20px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn:hover {
+            background: var(--primary-dark);
+        }
+
+        .btn-secondary {
+            background: var(--text-muted);
+        }
+
+        .btn-secondary:hover {
+            background: var(--text);
+        }
+
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            font-size: 14px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .loading-spinner {
+            animation: pulse 1.5s infinite;
+        }
+
+        footer {
+            text-align: center;
+            padding: 20px;
+            color: var(--text-muted);
+            font-size: 13px;
+            border-top: 1px solid var(--border);
+            margin-top: 30px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Summy AI Gateway</h1>
+            <p>v1.4.0 - Autonomous Edge AI Dashboard</p>
+        </div>
+    </header>
+
+    <main class="container">
+        <div class="grid">
+            <div class="card">
+                <h2>System Status</h2>
+                <div id="status-container">
+                    <div class="loading loading-spinner">Loading...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Memory Usage</h2>
+                <div id="memory-container">
+                    <div class="loading loading-spinner">Loading...</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Model Performance</h2>
+                <div id="models-container">
+                    <div class="loading loading-spinner">Loading...</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Model Statistics</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th>Avg Latency (ms)</th>
+                        <th>Requests</th>
+                        <th>Routing Weight</th>
+                    </tr>
+                </thead>
+                <tbody id="model-stats-body">
+                    <tr>
+                        <td colspan="4" class="loading loading-spinner">Loading...</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="actions">
+                <button class="btn" onclick="refreshMetrics()">Refresh Metrics</button>
+            </div>
+        </div>
+    </main>
+
+    <footer>
+        <p>Summy v1.4.0 - Local Coder Agent | Running on ARMv7 Edge Hardware</p>
+    </footer>
+
+    <script>
+        const API_BASE = '';
+
+        async function fetchHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                return await response.json();
+            } catch (error) {
+                console.error('Failed to fetch health:', error);
+                return null;
+            }
+        }
+
+        async function fetchMetrics() {
+            try {
+                const response = await fetch(`${API_BASE}/metrics`);
+                return await response.json();
+            } catch (error) {
+                console.error('Failed to fetch metrics:', error);
+                return null;
+            }
+        }
+
+        function renderStatus(health) {
+            const container = document.getElementById('status-container');
+            
+            if (!health) {
+                container.innerHTML = `
+                    <div class="status-indicator status-error">
+                        <span class="status-dot"></span>
+                        Unreachable
+                    </div>
+                `;
+                return;
+            }
+
+            const isHealthy = health.status === 'healthy';
+            const statusClass = isHealthy ? 'status-healthy' : 'status-error';
+            
+            container.innerHTML = `
+                <div class="status-indicator ${statusClass}">
+                    <span class="status-dot"></span>
+                    ${health.status.charAt(0).toUpperCase() + health.status.slice(1)}
+                </div>
+            `;
+        }
+
+        function renderMemory(memory) {
+            const container = document.getElementById('memory-container');
+            
+            if (!memory) {
+                container.innerHTML = '<p class="loading">No data available</p>';
+                return;
+            }
+
+            const usagePercent = memory.usage_percent || 0;
+            const usedMB = (memory.used_bytes / (1024 * 1024)).toFixed(0);
+            const limitMB = (memory.limit_bytes / (1024 * 1024)).toFixed(0);
+            
+            let statusClass = 'status-healthy';
+            if (usagePercent > 80) statusClass = 'status-warning';
+            if (usagePercent > 90) statusClass = 'status-error';
+
+            container.innerHTML = `
+                <div class="stat">
+                    <span class="stat-label">Used Memory</span>
+                    <span class="stat-value">${usedMB} MB</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Limit</span>
+                    <span class="stat-value">${limitMB} MB</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Usage</span>
+                    <span class="stat-value">${usagePercent.toFixed(1)}%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: ${Math.min(usagePercent, 100)}%"></div>
+                </div>
+                ${memory.oom_predicted ? `
+                    <div style="margin-top: 10px;">
+                        <div class="status-indicator status-warning">
+                            <span class="status-dot"></span>
+                            OOM Risk Detected
+                        </div>
+                    </div>
+                ` : ''}
+            `;
+        }
+
+        function renderModelStats(metrics) {
+            const tbody = document.getElementById('model-stats-body');
+            
+            if (!metrics || !metrics.model_stats || metrics.model_stats.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4" class="loading">No model statistics available</td>
+                    </tr>
+                `;
+                return;
+            }
+
+            const weights = metrics.routing_weights || {};
+            
+            tbody.innerHTML = metrics.model_stats.map(stat => `
+                <tr>
+                    <td>${stat.model}</td>
+                    <td>${stat.ema_latency_ms ? stat.ema_latency_ms.toFixed(2) : 'N/A'}</td>
+                    <td>${stat.request_count}</td>
+                    <td>${weights[stat.model] ? (weights[stat.model] * 100).toFixed(1) + '%' : 'N/A'}</td>
+                </tr>
+            `).join('');
+        }
+
+        async function refreshMetrics() {
+            const [health, metrics] = await Promise.all([
+                fetchHealth(),
+                fetchMetrics()
+            ]);
+
+            if (health) {
+                renderStatus(health);
+                renderMemory(health.memory);
+            }
+
+            if (metrics) {
+                renderModelStats(metrics);
+            }
+        }
+
+        // Initial load
+        refreshMetrics();
+
+        // Auto-refresh every 10 seconds
+        setInterval(refreshMetrics, 10000);
+
+        // Service Worker registration for PWA
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(() => {
+                console.log('Service Worker registration failed');
+            });
+        }
+    </script>
+</body>
+</html>
