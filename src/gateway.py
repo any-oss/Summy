@@ -1,345 +1,334 @@
 """
-Multiplexing Gateway - HTTP server for AI inference with composite prompt building.
-Merges code generation, reasoning, and tool-use instructions into single prompts.
+Multiplexing Gateway - HTTP server combining Code, Reasoning, and Tool tasks.
+Routes composite prompts to models selected by Pipeline Optimizer.
+Uses aiohttp for non-blocking I/O.
 """
 
 import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Dict, Optional
 
 import aiohttp
 from aiohttp import web
 import yaml
 
-from warden import ResourceWarden, get_warden
-from pipeline_optimizer import PipelineOptimizer, get_optimizer
-from traffic_shaper import TrafficShaper
-
-
-# Configuration constants
-DEFAULT_MODEL = "tinyllama:1.1b-q5_K_M"
-DEFAULT_DB_PATH = "/data/summy.db"
-DEFAULT_OLLAMA_ENDPOINT = "http://ollama:11434/api/generate"
-DEFAULT_NUM_PREDICT = 512
-DEFAULT_TEMPERATURE = 0.3
-MODEL_KEEP_ALIVE_SEC = 300
-REQUEST_TIMEOUT_SEC = 120
-
-
-class TaskType(str, Enum):
-    """Supported task types for model routing."""
-    CODE = "code"
-    REASONING = "reasoning"
-    TOOL = "tool"
-    GENERAL = "general"
-
-
-@dataclass
-class InferenceResult:
-    """Result of an inference operation."""
-    success: bool
-    response: Optional[str] = None
-    error: Optional[str] = None
-    model: Optional[str] = None
-    latency_ms: float = 0.0
-
 
 class MultiplexingGateway:
     """HTTP gateway for multiplexed AI inference requests."""
 
-    def __init__(self, config_path: str = "/app/config/summy.yaml"):
+    def __init__(
+        self,
+        config_path: str = "./config/summy.yaml",
+        ollama_host: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ):
         self.config = self._load_config(config_path)
-        self.warden: ResourceWarden = get_warden()
-        self.optimizer: PipelineOptimizer = get_optimizer(
-            db_path=self.config.get('db_path', DEFAULT_DB_PATH)
+        self.ollama_host = ollama_host or os.environ.get(
+            "OLLAMA_HOST", "http://ollama:11434"
         )
-        rate_limit = self.config.get('rate_limit', {})
-        self.shaper = TrafficShaper(
-            tokens_per_minute=rate_limit.get('tokens_per_minute', 10),
-            burst=rate_limit.get('burst', 3)
+        self.db_path = db_path or os.environ.get(
+            "DB_PATH", "/data/summy.db"
         )
-        ollama_config = self.config.get('ollama', {})
-        self.ollama_endpoint = ollama_config.get('endpoint', DEFAULT_OLLAMA_ENDPOINT)
-        self.model_map = self.config.get('models', {}).get('map', {})
-        self.default_model = self.config.get('models', {}).get('default', DEFAULT_MODEL)
+
+        # Initialize components
+        from .warden import ResourceWarden
+        from .pipeline_optimizer import PipelineOptimizer
+        from .traffic_shaper import TrafficShaper
+
+        self.warden = ResourceWarden(ollama_host=self.ollama_host)
+        self.optimizer = PipelineOptimizer(db_path=self.db_path)
+        
+        rate_config = self.config.get("rate_limit", {})
+        self.traffic_shaper = TrafficShaper(
+            tokens_per_minute=rate_config.get("tokens_per_minute", 10),
+            burst=rate_config.get("burst", 3),
+        )
+
         self.app = web.Application()
         self._setup_routes()
 
-    def _load_config(self, config_path: str) -> dict:
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load configuration from YAML file."""
         try:
-            with open(config_path, 'r') as f:
-                return yaml.safe_load(f)
-        except (FileNotFoundError, yaml.YAMLError) as e:
-            print(f"[GATEWAY] Config load error: {e}, using defaults")
+            with open(config_path, "r") as f:
+                return yaml.safe_load(f) or {}
+        except (IOError, yaml.YAMLError):
             return {}
 
-    def _setup_routes(self):
+    def _setup_routes(self) -> None:
         """Configure HTTP routes."""
-        self.app.router.add_post('/api/v1/infer', self.handle_inference)
-        self.app.router.add_post('/api/v1/chat', self.handle_chat)
-        self.app.router.add_get('/health', self.handle_health)
-        self.app.router.add_get('/metrics', self.handle_metrics)
+        self.app.router.add_post("/api/generate", self.handle_generate)
+        self.app.router.add_post("/api/chat", self.handle_chat)
+        self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_get("/metrics", self.handle_metrics)
 
     def _build_composite_prompt(
         self,
         code_instruction: Optional[str] = None,
         reasoning_instruction: Optional[str] = None,
         tool_instruction: Optional[str] = None,
-        context: Optional[str] = None
+        user_prompt: Optional[str] = None,
     ) -> str:
         """Build a composite prompt merging multiple task types."""
-        sections = []
-
-        if context:
-            sections.append(f"CONTEXT:\n{context}\n")
+        parts = []
 
         if code_instruction:
-            sections.append(f"CODE GENERATION TASK:\n{code_instruction}\n")
+            parts.append(f"[CODE GENERATION]\n{code_instruction}")
 
         if reasoning_instruction:
-            sections.append(f"REASONING TASK:\n{reasoning_instruction}\n")
+            parts.append(f"[REASONING]\n{reasoning_instruction}")
 
         if tool_instruction:
-            sections.append(f"TOOL USAGE TASK:\n{tool_instruction}\n")
+            parts.append(f"[TOOL USE]\n{tool_instruction}")
 
-        if not sections:
-            return ""
+        if user_prompt:
+            parts.append(f"[USER INPUT]\n{user_prompt}")
 
-        sections.append(
-            "INSTRUCTIONS:\n"
-            "- Address all tasks in your response\n"
-            "- Use clear section headers for each task type\n"
-            "- For code: provide complete, executable code blocks\n"
-            "- For reasoning: show step-by-step logic\n"
-            "- For tools: specify function calls with parameters\n"
-        )
+        return "\n\n".join(parts) if parts else ""
 
-        return "\n".join(sections)
-
-    def _select_model_for_task(self, task_type: str) -> str:
-        """Select the appropriate model based on task type."""
-        model_name = self.model_map.get(task_type, self.default_model)
-        return model_name
+    def _get_model_for_task(self, task_type: str) -> str:
+        """Get the configured model for a specific task type."""
+        models_map = self.config.get("models", {}).get("map", {})
+        return models_map.get(task_type, self.config.get("models", {}).get("default", "tinyllama:1.1b-q5_K_M"))
 
     async def _call_ollama(
         self,
         model: str,
         prompt: str,
-        options: Optional[dict] = None
-    ) -> InferenceResult:
-        """Send request to Ollama API and return response."""
-        default_options = self.config.get('ollama', {}).get('options', {
-            'num_predict': DEFAULT_NUM_PREDICT,
-            'temperature': DEFAULT_TEMPERATURE
-        })
-
-        if options:
-            default_options.update(options)
+        options: Optional[Dict] = None,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        """Send request to Ollama API."""
+        url = f"{self.ollama_host}/api/generate"
 
         payload = {
-            'model': model,
-            'prompt': prompt,
-            'stream': False,
-            'options': default_options,
-            'keep_alive': MODEL_KEEP_ALIVE_SEC
+            "model": model,
+            "prompt": prompt,
+            "stream": stream,
+            "options": options or self.config.get("ollama", {}).get("options", {}),
         }
 
-        start_time = time.time()
+        timeout = aiohttp.ClientTimeout(total=120)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.ollama_endpoint,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC)
-                ) as response:
-                    latency_ms = (time.time() - start_time) * 1000
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    return {
+                        "error": f"Ollama API error: {resp.status}",
+                        "response": await resp.text(),
+                    }
 
-                    if response.status != 200:
-                        return InferenceResult(
-                            success=False,
-                            error=f"Ollama API returned status {response.status}",
-                            latency_ms=latency_ms
-                        )
+                response_data = await resp.json()
+                return response_data
 
-                    result = await response.json()
-                    await self.optimizer.record_latency(model, latency_ms)
+    async def handle_generate(self, request: web.Request) -> web.Response:
+        """Handle /api/generate endpoint."""
+        client_id = request.remote or "default"
 
-                    return InferenceResult(
-                        success=True,
-                        response=result.get('response', ''),
-                        model=model,
-                        latency_ms=latency_ms
-                    )
-
-        except asyncio.TimeoutError:
-            return InferenceResult(
-                success=False,
-                error='Ollama API timeout',
-                latency_ms=(time.time() - start_time) * 1000
-            )
-        except aiohttp.ClientError as e:
-            return InferenceResult(
-                success=False,
-                error=f'Ollama connection error: {str(e)}',
-                latency_ms=(time.time() - start_time) * 1000
-            )
-
-    async def handle_inference(self, request: web.Request) -> web.Response:
-        """Handle multiplexed inference request."""
-        client_ip = request.remote or 'unknown'
-        if not self.shaper.allow_request(client_ip):
+        # Check rate limit
+        if not await self.traffic_shaper.check_rate_limit(client_id):
             return web.json_response(
-                {'error': 'Rate limit exceeded'},
-                status=429
+                {"error": "Rate limit exceeded"}, status=429
             )
 
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return web.json_response(
-                {'error': 'Invalid JSON body'},
-                status=400
+                {"error": "Invalid JSON"}, status=400
             )
 
-        prompt = self._build_composite_prompt(
-            code_instruction=body.get('code'),
-            reasoning_instruction=body.get('reasoning'),
-            tool_instruction=body.get('tool'),
-            context=body.get('context')
+        # Extract task components
+        code_instr = body.get("code_instruction")
+        reasoning_instr = body.get("reasoning_instruction")
+        tool_instr = body.get("tool_instruction")
+        user_prompt = body.get("prompt", "")
+        model_override = body.get("model")
+
+        # Build composite prompt
+        composite_prompt = self._build_composite_prompt(
+            code_instruction=code_instr,
+            reasoning_instruction=reasoning_instr,
+            tool_instruction=tool_instr,
+            user_prompt=user_prompt,
         )
 
-        if not prompt.strip():
+        if not composite_prompt:
             return web.json_response(
-                {'error': 'No valid task instructions provided'},
-                status=400
+                {"error": "No prompt provided"}, status=400
             )
 
-        lock_acquired = await self.warden.acquire_model_lock()
-        if not lock_acquired:
+        # Acquire warden lock for serialized model loading
+        acquired = await self.warden.acquire_with_check(timeout=30.0)
+        if not acquired:
             return web.json_response(
-                {'error': 'Service temporarily unavailable due to memory constraints'},
-                status=503
+                {"error": "Resource unavailable - OOM risk"}, status=503
             )
+
+        start_time = time.time()
+        success = False
 
         try:
-            task_type = body.get('task_type', TaskType.GENERAL.value)
-            model = self.model_map.get(task_type) or await self.optimizer.get_best_model(
-                task_type, list(self.model_map.values())
-            ) or self.default_model
-
-            result = await self._call_ollama(model=model, prompt=prompt)
-
-            if result.success:
-                return web.json_response({
-                    'success': True,
-                    'response': result.response,
-                    'model_used': result.model,
-                    'latency_ms': result.latency_ms
-                })
+            # Determine model to use
+            if model_override:
+                model = model_override
             else:
-                return web.json_response({
-                    'success': False,
-                    'error': result.error,
-                    'latency_ms': result.latency_ms
-                }, status=502)
+                # Get best model from optimizer
+                model, _ = await self.optimizer.get_best_model()
+
+            # Call Ollama
+            response = await self._call_ollama(model, composite_prompt)
+
+            if "error" in response:
+                return web.json_response(response, status=500)
+
+            success = True
+            latency_ms = (time.time() - start_time) * 1000
+
+            # Record inference for optimizer
+            await self.optimizer.record_inference(model, latency_ms, success=True)
+
+            return web.json_response({
+                "response": response.get("response", ""),
+                "model": model,
+                "latency_ms": latency_ms,
+            })
 
         finally:
-            self.warden.release_model_lock()
+            self.warden.release()
 
     async def handle_chat(self, request: web.Request) -> web.Response:
-        """Handle simple chat request."""
-        client_ip = request.remote or 'unknown'
-        if not self.shaper.allow_request(client_ip):
+        """Handle /api/chat endpoint for conversational requests."""
+        client_id = request.remote or "default"
+
+        if not await self.traffic_shaper.check_rate_limit(client_id):
             return web.json_response(
-                {'error': 'Rate limit exceeded'},
-                status=429
+                {"error": "Rate limit exceeded"}, status=429
             )
 
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return web.json_response(
-                {'error': 'Invalid JSON body'},
-                status=400
+                {"error": "Invalid JSON"}, status=400
             )
 
-        message = body.get('message', '')
-        if not message.strip():
+        messages = body.get("messages", [])
+        if not messages:
             return web.json_response(
-                {'error': 'Empty message'},
-                status=400
+                {"error": "No messages provided"}, status=400
             )
 
-        lock_acquired = await self.warden.acquire_model_lock()
-        if not lock_acquired:
+        # Convert chat format to prompt
+        prompt_parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            prompt_parts.append(f"[{role.upper()}]: {content}")
+
+        user_prompt = "\n".join(prompt_parts)
+
+        # Use reasoning model by default for chat
+        model = body.get("model", self._get_model_for_task("reasoning"))
+
+        acquired = await self.warden.acquire_with_check(timeout=30.0)
+        if not acquired:
             return web.json_response(
-                {'error': 'Service temporarily unavailable due to memory constraints'},
-                status=503
+                {"error": "Resource unavailable - OOM risk"}, status=503
             )
+
+        start_time = time.time()
+        success = False
 
         try:
-            result = await self._call_ollama(model=self.default_model, prompt=message)
+            response = await self._call_ollama(model, user_prompt)
 
-            if result.success:
-                return web.json_response({
-                    'success': True,
-                    'response': result.response,
-                    'model_used': result.model,
-                    'latency_ms': result.latency_ms
-                })
-            else:
-                return web.json_response({
-                    'success': False,
-                    'error': result.error
-                }, status=502)
+            if "error" in response:
+                return web.json_response(response, status=500)
+
+            success = True
+            latency_ms = (time.time() - start_time) * 1000
+
+            await self.optimizer.record_inference(model, latency_ms, success=True)
+
+            return web.json_response({
+                "message": {
+                    "role": "assistant",
+                    "content": response.get("response", ""),
+                },
+                "model": model,
+                "latency_ms": latency_ms,
+            })
 
         finally:
-            self.warden.release_model_lock()
+            self.warden.release()
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """Health check endpoint."""
+        memory_status = self.warden.get_memory_status()
         return web.json_response({
-            'status': 'healthy',
-            'version': self.config.get('version', '1.4.0'),
-            'memory_limit_mb': self.warden.memory_limit_mb
+            "status": "healthy",
+            "memory": memory_status,
         })
 
     async def handle_metrics(self, request: web.Request) -> web.Response:
-        """Return service metrics."""
-        weights = await self.optimizer.get_routing_weights(list(self.model_map.values()))
+        """Metrics endpoint for monitoring."""
+        model_stats = await self.optimizer.get_all_model_stats()
+        routing_weights = await self.optimizer.get_routing_weights()
+        memory_status = self.warden.get_memory_status()
 
         return web.json_response({
-            'model_weights': weights,
-            'rate_limit': {
-                'tokens_per_minute': self.shaper.tokens_per_minute,
-                'burst': self.shaper.burst
-            },
-            'memory_samples': len(self.warden.memory_samples),
-            'current_memory_mb': self.warden.memory_samples[-1] if self.warden.memory_samples else 0
+            "model_stats": model_stats,
+            "routing_weights": routing_weights,
+            "memory": memory_status,
         })
 
-    def run(self, host: str = '0.0.0.0', port: int = 8000):
+    async def start(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         """Start the gateway server."""
-        self.warden.start_monitoring()
-        print(f"[GATEWAY] Starting on {host}:{port}")
-        web.run_app(self.app, host=host, port=port, print=lambda x: print(f"[GATEWAY] {x}"))
+        await self.warden.start_monitoring()
+
+        runner = web.AppRunner(self.app)
+        await runner.setup()
+
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+
+        print(f"Gateway started on http://{host}:{port}")
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await runner.cleanup()
+            await self.warden.stop_monitoring()
 
 
-def create_app() -> web.Application:
+def create_gateway_app(
+    config_path: str = "./config/summy.yaml",
+) -> web.Application:
     """Create and return the gateway application."""
-    gateway = MultiplexingGateway()
+    gateway = MultiplexingGateway(config_path=config_path)
     return gateway.app
 
 
-if __name__ == '__main__':
-    host = os.environ.get('HOST', '0.0.0.0')
-    port = int(os.environ.get('PORT', 8000))
+async def run_gateway(
+    host: str = "0.0.0.0",
+    port: int = 8000,
+    config_path: str = "./config/summy.yaml",
+) -> None:
+    """Run the gateway server."""
+    gateway = MultiplexingGateway(config_path=config_path)
+    await gateway.start(host, port)
 
-    gateway = MultiplexingGateway()
-    gateway.run(host=host, port=port)
+
+if __name__ == "__main__":
+    import sys
+
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "./config/summy.yaml"
+    
+    try:
+        asyncio.run(run_gateway(config_path=config_file))
+    except KeyboardInterrupt:
+        print("\nShutting down Gateway...")

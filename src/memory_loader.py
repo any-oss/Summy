@@ -1,170 +1,236 @@
 """
-Memory Loader - Lightweight HTTP server for serving static configuration files.
-Serves markdown files from the config directory with basic caching.
+Memory Loader - Lightweight HTTP server serving static markdown configuration files.
+Implements basic caching to minimize disk I/O.
 """
 
 import asyncio
+import hashlib
 import os
-import time
-from typing import Dict, Optional
-from aiohttp import web
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 
-class MemoryLoader:
-    """HTTP server for serving static configuration files with caching."""
+class MemoryLoaderCache:
+    """In-memory cache for served files."""
 
-    def __init__(self, config_dir: str = "/app/config", port: int = 9010):
-        self.config_dir = config_dir
-        self.port = port
-        self._cache: Dict[str, dict] = {}
-        self._cache_ttl = 60  # Cache TTL in seconds
-        self.app = web.Application()
-        self._setup_routes()
+    def __init__(self):
+        self._cache: Dict[str, Tuple[bytes, str, str]] = {}
+        self._lock = threading.Lock()
 
-    def _setup_routes(self):
-        """Configure HTTP routes."""
-        self.app.router.add_get('/config/{filename}', self.handle_get_config)
-        self.app.router.add_get('/list', self.handle_list_configs)
-        self.app.router.add_get('/health', self.handle_health)
+    def get(self, path: str) -> Optional[Tuple[bytes, str, str]]:
+        """Get cached file content. Returns (content, content_type, etag) or None."""
+        with self._lock:
+            return self._cache.get(path)
 
-    def _get_cache_key(self, filename: str) -> str:
-        """Generate cache key for a file."""
-        return f"{filename}:{os.path.getmtime(os.path.join(self.config_dir, filename))}"
+    def set(self, path: str, content: bytes, content_type: str, etag: str) -> None:
+        """Cache file content."""
+        with self._lock:
+            self._cache[path] = (content, content_type, etag)
 
-    def _is_cache_valid(self, filename: str) -> bool:
-        """Check if cached content is still valid."""
-        if filename not in self._cache:
-            return False
+    def invalidate(self, path: str) -> None:
+        """Remove a file from cache."""
+        with self._lock:
+            self._cache.pop(path, None)
 
-        cache_entry = self._cache[filename]
-        current_key = self._get_cache_key(filename)
+    def clear(self) -> None:
+        """Clear all cached content."""
+        with self._lock:
+            self._cache.clear()
 
-        return cache_entry.get('key') == current_key
 
-    def _read_file(self, filename: str) -> Optional[str]:
-        """Read file content from disk."""
-        filepath = os.path.join(self.config_dir, filename)
+class MemoryLoaderHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for serving static configuration files."""
 
-        # Security check: prevent directory traversal
-        if not os.path.abspath(filepath).startswith(os.path.abspath(self.config_dir)):
-            return None
+    cache = MemoryLoaderCache()
+    config_dir: str = "./config"
 
+    def log_message(self, format, *args):
+        """Suppress default logging."""
+        pass
+
+    def _get_content_type(self, path: str) -> str:
+        """Determine content type based on file extension."""
+        ext = Path(path).suffix.lower()
+        content_types = {
+            ".md": "text/markdown",
+            ".markdown": "text/markdown",
+            ".txt": "text/plain",
+            ".yaml": "application/x-yaml",
+            ".yml": "application/x-yaml",
+            ".json": "application/json",
+            ".html": "text/html",
+            ".css": "text/css",
+            ".js": "application/javascript",
+        }
+        return content_types.get(ext, "application/octet-stream")
+
+    def _compute_etag(self, content: bytes) -> str:
+        """Compute ETag for content."""
+        return f'"{hashlib.md5(content).hexdigest()}"'
+
+    def _send_response(
+        self, status_code: int, content: bytes, content_type: str, etag: Optional[str] = None
+    ) -> None:
+        """Send HTTP response with appropriate headers."""
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        if etag:
+            self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "public, max-age=300")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_GET(self) -> None:
+        """Handle GET requests."""
+        # Parse path and remove leading slash
+        request_path = self.path.lstrip("/")
+
+        # Security: prevent directory traversal
+        if ".." in request_path or request_path.startswith("/"):
+            self._send_response(403, b"Forbidden", "text/plain")
+            return
+
+        # Default to config directory
+        if not request_path:
+            request_path = "config"
+
+        # Build full file path
+        full_path = os.path.join(self.config_dir, request_path)
+
+        # Ensure the path is within config directory
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                return f.read()
-        except (FileNotFoundError, PermissionError, IOError):
-            return None
+            real_path = os.path.realpath(full_path)
+            real_config = os.path.realpath(self.config_dir)
+            if not real_path.startswith(real_config):
+                self._send_response(403, b"Forbidden", "text/plain")
+                return
+        except Exception:
+            self._send_response(403, b"Forbidden", "text/plain")
+            return
 
-    async def handle_get_config(self, request: web.Request) -> web.Response:
-        """Handle request for a specific configuration file."""
-        filename = request.match_info.get('filename', '')
-
-        if not filename:
-            return web.json_response(
-                {'error': 'Filename required'},
-                status=400
-            )
+        # Check if it's a directory - serve index if exists
+        if os.path.isdir(full_path):
+            index_path = os.path.join(full_path, "index.md")
+            if os.path.isfile(index_path):
+                full_path = index_path
+                request_path = os.path.join(request_path, "index.md")
+            else:
+                self._send_response(404, b"Not Found", "text/plain")
+                return
 
         # Check cache first
-        if self._is_cache_valid(filename):
-            cache_entry = self._cache[filename]
-            return web.Response(
-                text=cache_entry['content'],
-                content_type=cache_entry.get('content_type', 'text/plain'),
-                headers={'X-Cache': 'HIT'}
-            )
+        cached = self.cache.get(request_path)
+        if cached:
+            content, content_type, etag = cached
 
-        # Read from disk
-        content = self._read_file(filename)
+            # Check If-None-Match header for conditional GET
+            if_none_match = self.headers.get("If-None-Match")
+            if if_none_match and if_none_match == etag:
+                self.send_response(304)
+                self.end_headers()
+                return
 
-        if content is None:
-            return web.json_response(
-                {'error': f'File not found: {filename}'},
-                status=404
-            )
+            self._send_response(200, content, content_type, etag)
+            return
 
-        # Determine content type
-        content_type = 'text/plain'
-        if filename.endswith('.md'):
-            content_type = 'text/markdown'
-        elif filename.endswith('.yaml') or filename.endswith('.yml'):
-            content_type = 'application/x-yaml'
-        elif filename.endswith('.json'):
-            content_type = 'application/json'
-
-        # Update cache
-        self._cache[filename] = {
-            'key': self._get_cache_key(filename),
-            'content': content,
-            'content_type': content_type,
-            'cached_at': time.time()
-        }
-
-        return web.Response(
-            text=content,
-            content_type=content_type,
-            headers={'X-Cache': 'MISS'}
-        )
-
-    async def handle_list_configs(self, request: web.Request) -> web.Response:
-        """List all available configuration files."""
+        # Read file from disk
         try:
-            files = os.listdir(self.config_dir)
-            configs = []
+            with open(full_path, "rb") as f:
+                content = f.read()
+        except FileNotFoundError:
+            self._send_response(404, b"Not Found", "text/plain")
+            return
+        except IOError:
+            self._send_response(500, b"Internal Server Error", "text/plain")
+            return
 
-            for filename in files:
-                filepath = os.path.join(self.config_dir, filename)
-                if os.path.isfile(filepath):
-                    file_stat = os.stat(filepath)
-                    configs.append({
-                        'name': filename,
-                        'size': file_stat.st_size,
-                        'modified': time.strftime(
-                            '%Y-%m-%d %H:%M:%S',
-                            time.localtime(file_stat.st_mtime)
-                        ),
-                        'cached': filename in self._cache
-                    })
+        content_type = self._get_content_type(full_path)
+        etag = self._compute_etag(content)
 
-            return web.json_response({'configs': configs})
+        # Cache the content
+        self.cache.set(request_path, content, content_type, etag)
 
-        except (OSError, IOError) as e:
-            return web.json_response(
-                {'error': f'Failed to list configs: {str(e)}'},
-                status=500
-            )
+        self._send_response(200, content, content_type, etag)
 
-    async def handle_health(self, request: web.Request) -> web.Response:
-        """Health check endpoint."""
-        return web.json_response({
-            'status': 'healthy',
-            'config_dir': self.config_dir,
-            'port': self.port,
-            'cache_entries': len(self._cache)
-        })
+    def do_HEAD(self) -> None:
+        """Handle HEAD requests (for checking if file exists)."""
+        request_path = self.path.lstrip("/")
 
-    def run(self, host: str = '0.0.0.0'):
-        """Start the memory loader server."""
-        print(f"[MEMORY_LOADER] Starting on {host}:{self.port}")
-        print(f"[MEMORY_LOADER] Serving configs from: {self.config_dir}")
-        web.run_app(
-            self.app,
-            host=host,
-            port=self.port,
-            print=lambda x: print(f"[MEMORY_LOADER] {x}")
-        )
+        if ".." in request_path:
+            self.send_response(403)
+            self.end_headers()
+            return
 
+        full_path = os.path.join(self.config_dir, request_path)
 
-def create_app(config_dir: str = "/app/config") -> web.Application:
-    """Create and return the memory loader application."""
-    loader = MemoryLoader(config_dir=config_dir)
-    return loader.app
+        try:
+            if not os.path.isfile(full_path):
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            cached = self.cache.get(request_path)
+            if cached:
+                content, content_type, etag = cached
+            else:
+                with open(full_path, "rb") as f:
+                    content = f.read()
+                content_type = self._get_content_type(full_path)
+                etag = self._compute_etag(content)
+                self.cache.set(request_path, content, content_type, etag)
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("ETag", etag)
+            self.end_headers()
+        except Exception:
+            self.send_response(500)
+            self.end_headers()
 
 
-if __name__ == '__main__':
-    host = os.environ.get('HOST', '0.0.0.0')
-    port = int(os.environ.get('PORT', 9010))
-    config_dir = os.environ.get('CONFIG_DIR', '/app/config')
+def create_memory_loader_server(
+    host: str = "0.0.0.0",
+    port: int = 9010,
+    config_dir: str = "./config",
+) -> HTTPServer:
+    """Create and configure the memory loader HTTP server."""
+    MemoryLoaderHandler.config_dir = config_dir
+    server = HTTPServer((host, port), MemoryLoaderHandler)
+    return server
 
-    loader = MemoryLoader(config_dir=config_dir, port=port)
-    loader.run(host=host)
+
+async def run_memory_loader(
+    host: str = "0.0.0.0",
+    port: int = 9010,
+    config_dir: str = "./config",
+) -> None:
+    """Run the memory loader server asynchronously."""
+    server = create_memory_loader_server(host, port, config_dir)
+
+    loop = asyncio.get_event_loop()
+    server_thread = threading.Thread(target=server.serve_forever)
+    server_thread.daemon = True
+    server_thread.start()
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        server.shutdown()
+        server_thread.join()
+
+
+if __name__ == "__main__":
+    import sys
+
+    config_directory = sys.argv[1] if len(sys.argv) > 1 else "./config"
+    print(f"Starting Memory Loader on port 9010, serving: {config_directory}")
+
+    try:
+        asyncio.run(run_memory_loader(config_dir=config_directory))
+    except KeyboardInterrupt:
+        print("\nShutting down Memory Loader...")
