@@ -12,6 +12,10 @@ models:
   default: "tinyllama:1.1b-q5_K_M"
 ollama:
   endpoint: "http://ollama:11434/api/generate"
+  max_retries: 3
+  retry_delay: 1.0
+  timeout: 120.0
+  connect_timeout: 10.0
   options:
     num_predict: 512
     temperature: 0.3

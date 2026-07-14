@@ -7,7 +7,10 @@ and enforces serialized model loading via asyncio.Lock.
 import asyncio
 import os
 from collections import deque
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import aiohttp
 
 
 class ResourceWarden:
@@ -119,7 +122,7 @@ class ResourceWarden:
 
         return will_oom, time_to_oom
 
-    async def _evict_model(self) -> bool:
+    async def _evict_model(self, session=None) -> bool:
         """Send request to Ollama to evict the current model."""
         import aiohttp
 
@@ -130,12 +133,22 @@ class ResourceWarden:
             "keep_alive": 0,
         }
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=5.0) as resp:
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        
+        # Use provided session or create temporary one
+        if session is not None:
+            try:
+                async with session.post(url, json=payload, timeout=timeout) as resp:
                     return resp.status == 200
-        except Exception:
-            return False
+            except Exception:
+                return False
+        else:
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as temp_session:
+                    async with temp_session.post(url, json=payload) as resp:
+                        return resp.status == 200
+            except Exception:
+                return False
 
     async def _monitor_loop(self) -> None:
         """Background monitoring loop."""
