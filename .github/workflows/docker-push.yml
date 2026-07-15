@@ -1,4 +1,4 @@
-name: dev
+name: summy
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build
-        run: docker build -t anydockerhub/dev:latest .
+        run: docker build -t anydockerhub/summy:latest .
 
       - name: Push
-        run: docker push anydockerhub/dev:latest
+        run: docker push anydockerhub/summy:latest
