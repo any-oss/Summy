@@ -1,5 +1,6 @@
 """
 Refactored Pipeline Optimizer - Clean, modular dynamic routing with ML-based predictions.
+Optimized for low-latency inference routing with reduced lock contention.
 """
 
 import asyncio
@@ -12,6 +13,8 @@ from typing import Optional, Dict, List, Tuple
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import weakref
 
 
 @dataclass
@@ -55,6 +58,8 @@ class ModelStats:
 
 class _KalmanFilter:
     """Kalman Filter for noise-resistant latency estimation."""
+    
+    __slots__ = ['process_noise', 'measurement_noise']
     
     def __init__(self, process_noise: float = 0.1, measurement_noise: float = 10.0):
         self.process_noise = process_noise
@@ -108,11 +113,15 @@ class PipelineOptimizer:
         self.thompson_sampling = thompson_sampling
         self.tail_latency_percentile = tail_latency_percentile
         
+        # Thread pool for non-blocking DB operations
+        self._executor = ThreadPoolExecutor(max_workers=db_pool_size)
+
         # In-memory cache for ModelStats
         self._stats_cache: Dict[str, ModelStats] = {}
         
-        # Single lock for both cache and DB operations
-        self._lock = asyncio.Lock()
+        # Separate locks for reads and writes to reduce contention
+        self._write_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
         
         # Initialize database
         self._db_initialized = False
@@ -242,7 +251,7 @@ class PipelineOptimizer:
         timestamp = time.time()
 
         # Update in-memory cache first (fast path)
-        async with self._lock:
+        async with self._write_lock:
             if model not in self._stats_cache:
                 self._stats_cache[model] = ModelStats(
                     ema_alpha=self.ema_alpha,
@@ -359,7 +368,7 @@ class PipelineOptimizer:
         Returns:
             (model_name, expected_latency_ms) with Kalman-filtered estimate
         """
-        async with self._lock:
+        async with self._write_lock:
             if not self._stats_cache:
                 # Fallback to DB if cache is empty
                 try:
@@ -426,7 +435,7 @@ class PipelineOptimizer:
         Higher weight = more likely to be selected.
         Uses in-memory cache for fast computation.
         """
-        async with self._lock:
+        async with self._write_lock:
             if not self._stats_cache:
                 return {self.default_model: 1.0}
 
@@ -468,13 +477,13 @@ class PipelineOptimizer:
 
     async def get_model_latency(self, model: str) -> Optional[float]:
         """Get the current Kalman-filtered latency for a specific model."""
-        async with self._lock:
+        async with self._write_lock:
             stats = self._stats_cache.get(model)
             return stats.kalman_estimate if stats else None
 
     async def get_model_stats_detailed(self, model: str) -> Optional[Dict]:
         """Get detailed statistics for a specific model including all metrics."""
-        async with self._lock:
+        async with self._write_lock:
             stats = self._stats_cache.get(model)
             if not stats:
                 return None
@@ -499,7 +508,7 @@ class PipelineOptimizer:
 
     async def get_all_model_stats(self) -> List[Dict]:
         """Get comprehensive statistics for all tracked models."""
-        async with self._lock:
+        async with self._write_lock:
             return [
                 {
                     "model": model,
@@ -521,7 +530,7 @@ class PipelineOptimizer:
 
     async def reset_stats(self, model: Optional[str] = None) -> None:
         """Reset statistics for a specific model or all models."""
-        async with self._lock:
+        async with self._write_lock:
             if model:
                 self._stats_cache.pop(model, None)
                 try:
