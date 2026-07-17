@@ -1,28 +1,22 @@
 """
-Pipeline Optimizer - Advanced dynamic routing with multi-factor ML-based predictions.
-Tracks inference latency, throughput, error rates, and confidence scores using:
-- Kalman Filter for noise-resistant latency estimation
-- Thompson Sampling for exploration-exploitation balance
-- Multi-armed bandit for optimal model selection
-- Time-decay weighting for recent performance emphasis
-- Quantile tracking for tail latency (p95, p99) guarantees
+Refactored Pipeline Optimizer - Clean, modular dynamic routing with ML-based predictions.
 """
 
 import asyncio
 import sqlite3
 import time
 import math
+import random
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from collections import deque
-import random
 
 
 @dataclass
 class ModelStats:
-    """Advanced statistics for a model with multiple tracking metrics."""
+    """Statistics for a model with multiple tracking metrics."""
     # Kalman Filter state for latency estimation
     kalman_estimate: float = 0.0
     kalman_variance: float = 1000.0
@@ -41,15 +35,15 @@ class ModelStats:
     total_count: int = 0
     error_rate_ema: float = 0.0
     
-    # Quantile estimation for tail latency (using P² algorithm approximation)
+    # Quantile estimation for tail latency
     p50_latency: float = 0.0
     p95_latency: float = 0.0
     p99_latency: float = 0.0
     latency_samples: deque = field(default_factory=lambda: deque(maxlen=100))
     
-    # Thompson Sampling parameters (Beta distribution for success probability)
-    alpha_success: float = 1.0  # Prior successes
-    beta_failure: float = 1.0   # Prior failures
+    # Thompson Sampling parameters (Beta distribution)
+    alpha_success: float = 1.0
+    beta_failure: float = 1.0
     
     # Time decay for recency weighting
     last_updated: float = 0.0
@@ -59,8 +53,43 @@ class ModelStats:
     request_count: int = 0
 
 
+class _KalmanFilter:
+    """Kalman Filter for noise-resistant latency estimation."""
+    
+    def __init__(self, process_noise: float = 0.1, measurement_noise: float = 10.0):
+        self.process_noise = process_noise
+        self.measurement_noise = measurement_noise
+    
+    def update(self, estimate: float, variance: float, measurement: float) -> Tuple[float, float]:
+        """Update Kalman estimate with new measurement."""
+        # Prediction step
+        variance += self.process_noise
+        
+        # Update step
+        gain = variance / (variance + self.measurement_noise)
+        new_estimate = estimate + gain * (measurement - estimate)
+        new_variance = (1 - gain) * variance
+        
+        return new_estimate, new_variance
+
+
+class _ThompsonSampler:
+    """Thompson Sampling for exploration-exploitation balance."""
+    
+    @staticmethod
+    def sample(alpha: float, beta: float) -> float:
+        """Sample from Beta(alpha, beta) distribution."""
+        if alpha < 1 or beta < 1:
+            return alpha / (alpha + beta)
+        
+        # Ratio of Gamma variates approximation
+        gamma_alpha = max(0.001, sum(-math.log(random.random()) for _ in range(max(1, int(alpha)))))
+        gamma_beta = max(0.001, sum(-math.log(random.random()) for _ in range(max(1, int(beta)))))
+        return gamma_alpha / (gamma_alpha + gamma_beta)
+
+
 class PipelineOptimizer:
-    """Advanced dynamic model router with ML-based predictions and uncertainty quantification."""
+    """Dynamic model router with ML-based predictions."""
 
     def __init__(
         self,
@@ -75,18 +104,17 @@ class PipelineOptimizer:
         self.db_path = db_path
         self.ema_alpha = ema_alpha
         self.default_model = default_model
-        self.kalman_process_noise = kalman_process_noise
-        self.kalman_measurement_noise = kalman_measurement_noise
+        self.kalman_filter = _KalmanFilter(kalman_process_noise, kalman_measurement_noise)
         self.thompson_sampling = thompson_sampling
         self.tail_latency_percentile = tail_latency_percentile
         
-        # In-memory cache for ModelStats (single source of truth for reads)
+        # In-memory cache for ModelStats
         self._stats_cache: Dict[str, ModelStats] = {}
         
         # Single lock for both cache and DB operations
         self._lock = asyncio.Lock()
         
-        # SQLite connection pool
+        # Initialize database
         self._db_initialized = False
         self._initialize_db()
 
